@@ -3,46 +3,42 @@ set -e
 
 echo "=== HSProxy - Instalação ==="
 
-# Atualiza sistema e instala dependências
+# Instala dependências
 apt-get update -qq
 apt-get install -y build-essential cmake libevent-dev libssl-dev pkg-config openssl
 
-# Diretório do projeto
+# Diretório de instalação
 INSTALL_DIR="/opt/hsproxy"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
-# Copia os arquivos do projeto
-echo "Copiando arquivos..."
-cp -r /home/workdir/HSProxy/* . 2>/dev/null || true
+echo "Copiando arquivos do projeto..."
 
-# Torna executável
-chmod +x compile.sh
+# Copia todos os arquivos do diretório atual (onde está o install.sh)
+cp -r "$(dirname "$0")"/* . 2>/dev/null || true
 
-# Compila os binários
+# Garante que os scripts têm permissão de execução
+chmod +x compile.sh menu.sh 2>/dev/null || true
+
+# Compila
 echo "Compilando binários..."
 ./compile.sh
 
-# Cria diretório para certificados
+# Certificados SSL
 mkdir -p /opt/magnumproxy
-if [ ! -f "/opt/magnumproxy/cert.pem" ] || [ ! -f "/opt/magnumproxy/key.pem" ]; then
-    echo "Gerando certificados SSL auto-assinados..."
+if [ ! -f "/opt/magnumproxy/cert.pem" ]; then
+    echo "Gerando certificados SSL..."
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout /opt/magnumproxy/key.pem \
         -out /opt/magnumproxy/cert.pem \
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=HSProxy/CN=localhost" 2>/dev/null || true
 fi
 
-# Cria links dos binários
+# Links dos comandos
 ln -sf "$INSTALL_DIR/build/proxy" /usr/local/bin/hsproxy-http 2>/dev/null || true
 ln -sf "$INSTALL_DIR/build/sslproxy" /usr/local/bin/hsproxy-ssl 2>/dev/null || true
 ln -sf "$INSTALL_DIR/menu.sh" /usr/local/bin/hsproxy-menu 2>/dev/null || true
 
 echo ""
-echo "=== Instalação concluída com sucesso! ==="
-echo "Comandos disponíveis:"
-echo "   hsproxy-menu          → Abre o menu de gerenciamento"
-echo "   hsproxy-http --help   → Proxy HTTP"
-echo "   hsproxy-ssl           → Proxy HTTPS"
-echo ""
-echo "Execute: hsproxy-menu"
+echo "=== Instalação Concluída! ==="
+echo "Agora execute: hsproxy-menu"
