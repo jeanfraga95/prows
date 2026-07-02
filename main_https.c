@@ -6,6 +6,8 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <getopt.h>
+
 #include <event2/buffer.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -13,12 +15,22 @@
 #include <event2/bufferevent.h>
 #include <event2/bufferevent_ssl.h>
 
-int PORT = 8080;
+int PORT = 443;
 int TO_PORT = 22;
-#define BUFFER_SIZE 8192
 
 SSL_CTX *ssl_ctx;
 struct event_base *base;
+
+bool is_number(const char *str) {
+    if (!str || *str == '\0') return false;
+    char *endptr;
+    errno = 0;
+    long val = strtol(str, &endptr, 10);
+    if (errno != 0 || *endptr != '\0' || str == endptr) {
+        return false;
+    }
+    return val >= 1 && val <= 65535;
+}
 
 void init_openssl() {
     SSL_load_error_strings();
@@ -86,7 +98,8 @@ void on_accept(evutil_socket_t listener, short event, void *arg) {
     if (client_fd < 0) return;
 
     SSL *ssl = SSL_new(ssl_ctx);
-    struct bufferevent *bev_ssl = bufferevent_openssl_socket_new(base, client_fd, ssl, BUFFEREVENT_SSL_ACCEPTING,
+    struct bufferevent *bev_ssl = bufferevent_openssl_socket_new(base, client_fd, ssl,
+                                                                 BUFFEREVENT_SSL_ACCEPTING,
                                                                  BEV_OPT_CLOSE_ON_FREE);
 
     int remote_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -115,51 +128,64 @@ void on_accept(evutil_socket_t listener, short event, void *arg) {
     bufferevent_enable(bev_remote, EV_READ | EV_WRITE);
 }
 
-bool is_number(const char *str) {
-    char *endptr;
-    errno = 0;
-
-    const long val = strtol(str, &endptr, 10);
-    if (errno != 0 || *endptr != '\0' || str == endptr) {
-        return false;
-    }
-
-    return val >= 1 && val <= 65535;
+void print_usage(const char *progname) {
+    printf("Uso: %s [opções]\n", progname);
+    printf("Opções:\n");
+    printf("  -p, --port <número>     Porta de escuta (padrão: 443)\n");
+    printf("  -t, --to <número>       Porta de destino (padrão: 22)\n");
+    printf("  -h, --help              Mostra esta ajuda\n");
+    printf("\nExemplos:\n");
+    printf("  %s --port 8443\n", progname);
+    printf("  %s -port 9443 --to 80\n", progname);
+    printf("  %s -p 8443 -t 22\n", progname);
 }
 
-
 int main(int argc, char *argv[]) {
-    if (argc > 1) {
-        if (is_number(argv[2])) {
-            TO_PORT = atoi(argv[2]);
-        } else {
-            printf("Porta de destino inválida: %s\n", argv[1]);
-            return 1;
+    static struct option long_options[] = {
+        {"port", required_argument, 0, 'p'},
+        {"to",   required_argument, 0, 't'},
+        {"help", no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "p:t:h", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'p':
+                if (!is_number(optarg) || (PORT = atoi(optarg)) < 1 || PORT > 65535) {
+                    fprintf(stderr, "❌ Porta de escuta inválida: %s\n", optarg);
+                    return 1;
+                }
+                break;
+            case 't':
+                if (!is_number(optarg) || (TO_PORT = atoi(optarg)) < 1 || TO_PORT > 65535) {
+                    fprintf(stderr, "❌ Porta de destino inválida: %s\n", optarg);
+                    return 1;
+                }
+                break;
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            case '?':
+                print_usage(argv[0]);
+                return 1;
+            default:
+                break;
         }
     }
 
-    if (argc > 3) {
-        if (is_number(argv[4])) {
-            PORT = atoi(argv[4]);
-        } else {
-            printf("Porta inválida: %s\n", argv[1]);
-            return 1;
-        }
-    }
+    printf("🔐 SSL Proxy iniciado: %d → %d\n", PORT, TO_PORT);
 
     init_openssl();
     ssl_ctx = create_context();
     configure_context(ssl_ctx);
-
     base = event_base_new();
 
     int listener_fd = -1;
     int ipv6_available = 0;
 
-    // Primeiro tentar criar um socket IPv6
     int test_fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (test_fd >= 0) {
-        // IPv6 está disponível, desativar IPV6_V6ONLY para aceitar conexões IPv4 mapeadas
         int off = 0;
         if (setsockopt(test_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off)) == 0) {
             ipv6_available = 1;
@@ -168,13 +194,10 @@ int main(int argc, char *argv[]) {
     }
 
     if (ipv6_available) {
-        // Usar socket IPv6 em modo dual-stack
         listener_fd = socket(AF_INET6, SOCK_STREAM, 0);
         if (listener_fd >= 0) {
-            int opt = 1;
-            setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-            // Confirmar que IPV6_V6ONLY está desativado para aceitar IPv4 também
+            int optval = 1;
+            setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
             int off = 0;
             setsockopt(listener_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
 
@@ -184,31 +207,25 @@ int main(int argc, char *argv[]) {
                 .sin6_addr = in6addr_any
             };
 
-            if (bind(listener_fd, (struct sockaddr *)&addr6, sizeof(addr6)) != 0) {
-                // Se falhar em fazer bind no IPv6, fechar o socket para tentar IPv4
+            if (bind(listener_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
+                printf("✅ Dual Stack (IPv4+IPv6) na porta %d\n", PORT);
+            } else {
                 close(listener_fd);
                 listener_fd = -1;
                 ipv6_available = 0;
-            } else {
-                printf("SSL proxy iniciado em modo dual stack (IPv4/IPv6) na porta %d\n", PORT);
             }
-        } else {
-            ipv6_available = 0;
         }
     }
 
-    // Se IPv6 não estiver disponível ou falhar, tentar com IPv4
     if (!ipv6_available) {
         listener_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (listener_fd < 0) {
-            fprintf(stderr, "Falha ao criar socket\n");
-            SSL_CTX_free(ssl_ctx);
-            cleanup_openssl();
-            return 1;
+            fprintf(stderr, "❌ Falha ao criar socket\n");
+            goto cleanup;
         }
 
-        int opt = 1;
-        setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        int optval = 1;
+        setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
         struct sockaddr_in addr = {
             .sin_family = AF_INET,
@@ -217,34 +234,27 @@ int main(int argc, char *argv[]) {
         };
 
         if (bind(listener_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-            fprintf(stderr, "Falha ao fazer bind na porta %d\n", PORT);
-            close(listener_fd);
-            SSL_CTX_free(ssl_ctx);
-            cleanup_openssl();
-            return 1;
+            fprintf(stderr, "❌ Falha ao bind na porta %d\n", PORT);
+            goto cleanup;
         }
-
-        printf("SSL proxy iniciado apenas em IPv4 na porta %d\n", PORT);
+        printf("✅ IPv4 na porta %d\n", PORT);
     }
 
     if (listen(listener_fd, 16) != 0) {
-        fprintf(stderr, "Falha ao iniciar listen\n");
-        close(listener_fd);
-        SSL_CTX_free(ssl_ctx);
-        cleanup_openssl();
-        return 1;
+        fprintf(stderr, "❌ Falha no listen\n");
+        goto cleanup;
     }
 
     struct event *listener_event = event_new(base, listener_fd, EV_READ | EV_PERSIST, on_accept, NULL);
     event_add(listener_event, NULL);
 
-    printf("Aguardando conexões...\n");
+    printf("🚀 Aguardando conexões na porta %d...\n", PORT);
     event_base_dispatch(base);
 
-    event_free(listener_event);
-    close(listener_fd);
-    event_base_free(base);
-    SSL_CTX_free(ssl_ctx);
+cleanup:
+    if (listener_fd >= 0) close(listener_fd);
+    if (base) event_base_free(base);
+    if (ssl_ctx) SSL_CTX_free(ssl_ctx);
     cleanup_openssl();
     return 0;
 }
