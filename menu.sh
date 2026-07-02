@@ -1,12 +1,8 @@
 #!/bin/bash
 
 # =============================================
-# HSProxy - Menu de Gerenciamento de Portas
+# HSProxy - Menu Melhorado
 # =============================================
-
-CONFIG_DIR="/etc/hsproxy"
-LOG_DIR="/var/log/hsproxy"
-mkdir -p "$CONFIG_DIR" "$LOG_DIR"
 
 HTTP_BIN="/usr/local/bin/hsproxy-http"
 SSL_BIN="/usr/local/bin/hsproxy-ssl"
@@ -16,7 +12,7 @@ show_menu() {
     echo "=========================================="
     echo "       HSProxy - Gerenciador de Portas     "
     echo "=========================================="
-    echo "1. Abrir Porta HTTP (comum)"
+    echo "1. Abrir Porta HTTP"
     echo "2. Abrir Porta HTTPS (SSL)"
     echo "3. Fechar Porta"
     echo "4. Ver Portas Abertas"
@@ -26,24 +22,41 @@ show_menu() {
     read -p "Escolha uma opção [1-6]: " option
 }
 
+# ==================== LISTAR PORTAS ====================
 list_open_ports() {
-    echo "=== Portas Ativas ==="
-    ps aux | grep -E "(hsproxy-http|hsproxy-ssl)" | grep -v grep || echo "Nenhuma porta ativa."
-    echo ""
-    echo "=== Portas TCP abertas ==="
-    ss -tuln | grep -E ':(80|443|8080|22)' || echo "Nenhuma porta detectada."
+    echo "• SERVICOS EM EXECUCAO •"
+    echo "========================================"
+
+    # Lista serviços hsproxy + outros serviços comuns
+    {
+        # Serviços hsproxy
+        ps aux | grep -E "hsproxy-(http|ssl)" | grep -v grep | awk '{print $11 " " $12}' | while read -r cmd; do
+            port=$(echo "$cmd" | grep -oE '[0-9]+$' || echo "??")
+            echo "SERVICO: hsproxy PORTA: $port"
+        done
+
+        # Outros serviços
+        netstat -tuln 2>/dev/null | grep -E ':(22|53|80|443|8080|5432|5500|6969|7270|7300|81)' | awk '{print $4}' | while read -r line; do
+            port=$(echo "$line" | awk -F: '{print $NF}')
+            service=$(ss -tuln | grep ":$port" | head -1 | awk '{print $5}' | cut -d/ -f1 | xargs -I{} basename {} 2>/dev/null || echo "unknown")
+            [[ -n "$service" && "$service" != "unknown" ]] && echo "SERVICO: $service PORTA: $port"
+        done
+    } | sort -u | head -20
+
+    echo "========================================"
 }
 
+# ==================== ABRIR HTTP ====================
 open_http_port() {
     read -p "Digite a porta HTTP (ex: 80): " port
-    read -p "Porta destino (SSH) [22]: " to_port
+    read -p "Porta destino SSH [22]: " to_port
     to_port=${to_port:-22}
 
     service_name="hsproxy-http-$port"
 
     cat > /etc/systemd/system/$service_name.service << EOF
 [Unit]
-Description=HSProxy HTTP Porta $port
+Description=HSProxy HTTP on port $port
 After=network.target
 
 [Service]
@@ -52,26 +65,29 @@ ExecStart=$HTTP_BIN --port $port --to-port $to_port
 Restart=always
 RestartSec=3
 User=root
-
-[Install]
-WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now $service_name
-    echo "✅ Porta HTTP $port aberta (→ $to_port)"
+    systemctl enable --now $service_name >/dev/null 2>&1
+
+    if systemctl is-active --quiet $service_name; then
+        echo "✅ Porta HTTP $port aberta com sucesso!"
+    else
+        echo "❌ Falha ao abrir porta HTTP $port"
+    fi
 }
 
+# ==================== ABRIR HTTPS (SSL) ====================
 open_https_port() {
-    read -p "Digite a porta HTTPS (ex: 443): " port
-    read -p "Porta destino (SSH) [22]: " to_port
+    read -p "Digite a porta HTTPS (ex: 443 ou 8080): " port
+    read -p "Porta destino SSH [22]: " to_port
     to_port=${to_port:-22}
 
     service_name="hsproxy-ssl-$port"
 
     cat > /etc/systemd/system/$service_name.service << EOF
 [Unit]
-Description=HSProxy HTTPS Porta $port
+Description=HSProxy HTTPS on port $port
 After=network.target
 
 [Service]
@@ -80,34 +96,44 @@ ExecStart=$SSL_BIN $to_port $port
 Restart=always
 RestartSec=3
 User=root
-
-[Install]
-WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now $service_name
-    echo "✅ Porta HTTPS $port aberta (→ $to_port)"
+    systemctl enable --now $service_name >/dev/null 2>&1
+
+    sleep 1
+    if systemctl is-active --quiet $service_name; then
+        echo "✅ Porta HTTPS $port aberta com sucesso!"
+    else
+        echo "❌ Falha ao abrir porta HTTPS $port"
+        journalctl -u $service_name --no-pager -n 10
+    fi
 }
 
+# ==================== FECHAR PORTA ====================
 close_port() {
     read -p "Digite a porta para fechar: " port
-    for svc in $(systemctl list-units --type=service | grep -o "hsproxy-.*-$port[^ ]*"); do
-        systemctl stop "$svc" 2>/dev/null
-        systemctl disable "$svc" 2>/dev/null
-        rm -f "/etc/systemd/system/$svc"
+
+    for service in $(systemctl list-units --type=service | grep -E "hsproxy-(http|ssl)-.*$port" | awk '{print $1}'); do
+        echo "Parando: $service"
+        systemctl stop "$service" 2>/dev/null
+        systemctl disable "$service" 2>/dev/null
+        rm -f "/etc/systemd/system/$service"
     done
+
     systemctl daemon-reload
-    echo "✅ Porta $port fechada."
+    echo "✅ Tentativa de fechamento da porta $port concluída."
 }
 
+# ==================== STATUS ====================
 show_status() {
-    echo "=== Status das Conexões ==="
-    journalctl -u "hsproxy-*" --no-pager -n 30 --since "2 hours ago" 2>/dev/null || true
+    echo "=== Status das Conexões HSProxy ==="
+    journalctl -u "hsproxy-*" --no-pager -n 30 --since "1 hour ago" 2>/dev/null || echo "Sem logs recentes."
     echo ""
     ps aux | grep -E "hsproxy" | grep -v grep
 }
 
+# ==================== LOOP PRINCIPAL ====================
 main() {
     while true; do
         show_menu
@@ -121,7 +147,7 @@ main() {
             *) echo "Opção inválida!" ;;
         esac
         echo ""
-        read -p "Pressione Enter para voltar ao menu..."
+        read -p "[Enter] para voltar ao menu..."
     done
 }
 
