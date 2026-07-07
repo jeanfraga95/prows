@@ -11,91 +11,25 @@
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 #include <event2/listener.h>
-#include <curl/curl.h>
+
+#include "ip_check.h"
 
 // --- Configurações Padrão ---
 int PORT = 80;
 int TO_PORT = 22;
 char* RESPONSE = "OK"; // Payload padrão para ambas as respostas
 
+// Intervalo (em segundos) entre reverificações de autorização de IP.
+#define IP_RECHECK_INTERVAL_SECONDS 300
+
 // Estrutura de contexto para cada par de conexões (cliente <-> remoto)
 typedef struct {
     struct bufferevent *client;
     struct bufferevent *remote;
     bool connected_to_remote;
-    bool ip_verified;  // Nova flag para controle
 } proxy_ctx_t;
 
 struct event_base *base;
-
-// Função para callback do CURL
-struct MemoryStruct {
-    char *memory;
-    size_t size;
-};
-
-static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
-    size_t realsize = size * nmemb;
-    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
-
-    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
-    if(!ptr) {
-        printf("Sem memória suficiente\n");
-        return 0;
-    }
-
-    mem->memory = ptr;
-    memcpy(&(mem->memory[mem->size]), contents, realsize);
-    mem->size += realsize;
-    mem->memory[mem->size] = 0;
-
-    return realsize;
-}
-
-// Função para verificar IP na API
-bool check_ip_authorization(const char *ip) {
-    CURL *curl_handle;
-    CURLcode res;
-    struct MemoryStruct chunk;
-    chunk.memory = malloc(1);
-    chunk.size = 0;
-
-    char url[256];
-    snprintf(url, sizeof(url), "https://check.cloudjf.com.br:2083/ip=%s", ip);
-
-    curl_global_init(CURL_GLOBAL_ALL);
-    curl_handle = curl_easy_init();
-
-    if(!curl_handle) {
-        free(chunk.memory);
-        return false;
-    }
-
-    curl_easy_setopt(curl_handle, CURLOPT_URL, url);
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0L);
-
-    res = curl_easy_perform(curl_handle);
-
-    bool authorized = false;
-    if(res == CURLE_OK) {
-        // Procura por "exists":true no JSON
-        if(strstr(chunk.memory, "\"exists\":true") != NULL) {
-            authorized = true;
-        } else if(strstr(chunk.memory, "\"exists\":false") != NULL) {
-            authorized = false;
-        }
-    }
-
-    curl_easy_cleanup(curl_handle);
-    curl_global_cleanup();
-    free(chunk.memory);
-
-    return authorized;
-}
 
 // Protótipos
 void client_read_cb(struct bufferevent *bev, void *user_data);
@@ -120,40 +54,10 @@ void remote_read_cb(struct bufferevent *bev, void *user_data) {
     }
 }
 
-// --- FUNÇÃO client_read_cb CORRIGIDA COM VERIFICAÇÃO DE IP ---
+// --- FUNÇÃO client_read_cb CORRIGIDA ---
 void client_read_cb(struct bufferevent *bev, void *user_data) {
     proxy_ctx_t *ctx = user_data;
     struct evbuffer *input = bufferevent_get_input(bev);
-
-    // VERIFICAÇÃO DE IP (executada apenas uma vez por conexão)
-    if (!ctx->ip_verified) {
-        struct sockaddr_in addr;
-        socklen_t addr_len = sizeof(addr);
-        if (getpeername(bufferevent_getfd(bev), (struct sockaddr*)&addr, &addr_len) == 0) {
-            char client_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
-            
-            printf("Verificando IP: %s\n", client_ip);
-            
-            if (!check_ip_authorization(client_ip)) {
-                printf("IP %s não autorizado! Encerrando conexão.\n", client_ip);
-                // Envia mensagem de erro
-                char error_msg[] = "HTTP/1.1 403 Forbidden\r\n\r\nIP não autorizado. Ative em @cloudjf2_bot";
-                bufferevent_write(bev, error_msg, strlen(error_msg));
-                bufferevent_flush(bev, EV_WRITE, BEV_FLUSH);
-                // Encerra a conexão após enviar a mensagem
-                free_proxy_ctx(ctx);
-                return;
-            }
-            
-            printf("IP %s autorizado! Continuando...\n", client_ip);
-            ctx->ip_verified = true;
-        } else {
-            // Não foi possível obter o IP, encerra a conexão
-            free_proxy_ctx(ctx);
-            return;
-        }
-    }
 
     // Se já estiver conectado ao remoto, repassa tudo normalmente
     if (ctx->connected_to_remote && ctx->remote) {
@@ -237,7 +141,6 @@ void client_read_cb(struct bufferevent *bev, void *user_data) {
         free_proxy_ctx(ctx);
     }
 }
-
 void event_cb(struct bufferevent *bev, short events, void *user_data) {
     proxy_ctx_t *ctx = user_data;
 
@@ -289,7 +192,6 @@ void accept_conn_cb(struct evconnlistener *listener, evutil_socket_t fd,
     proxy_ctx->client = bev;
     proxy_ctx->remote = NULL;
     proxy_ctx->connected_to_remote = false;
-    proxy_ctx->ip_verified = false;  // Nova flag
 
     // Envia a resposta HTTP 101 imediatamente.
     char response_buffer_101[256];
@@ -342,6 +244,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // --- Verificação de licença por IP ---
+    // O proxy só inicia se o IP externo desta máquina estiver autorizado.
+    if (!verify_license_or_die()) {
+        return 1;
+    }
+
     signal(SIGPIPE, SIG_IGN);
 
     base = event_base_new();
@@ -367,6 +275,10 @@ int main(int argc, char *argv[]) {
         event_base_free(base);
         return 1;
     }
+
+    // Reverifica periodicamente se o IP continua autorizado.
+    // Se deixar de estar, o processo é encerrado automaticamente.
+    schedule_periodic_ip_check(base, IP_RECHECK_INTERVAL_SECONDS);
 
     printf("Servidor iniciado na porta %d, encaminhando para 127.0.0.1:%d...\n",
            PORT, TO_PORT);
