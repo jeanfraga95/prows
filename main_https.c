@@ -7,7 +7,6 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <getopt.h>
-#include <curl/curl.h>
 
 #include <event2/buffer.h>
 #include <openssl/ssl.h>
@@ -16,80 +15,16 @@
 #include <event2/bufferevent.h>
 #include <event2/bufferevent_ssl.h>
 
+#include "ip_check.h"
+
 int PORT = 443;
 int TO_PORT = 22;
 
+// Intervalo (em segundos) entre reverificações de autorização de IP.
+#define IP_RECHECK_INTERVAL_SECONDS 300
+
 SSL_CTX *ssl_ctx;
 struct event_base *base;
-
-// Estrutura para callback do CURL
-struct MemoryStruct {
-    char *memory;
-    size_t size;
-};
-
-static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
-    size_t realsize = size * nmemb;
-    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
-
-    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
-    if(!ptr) {
-        printf("Sem memória suficiente\n");
-        return 0;
-    }
-
-    mem->memory = ptr;
-    memcpy(&(mem->memory[mem->size]), contents, realsize);
-    mem->size += realsize;
-    mem->memory[mem->size] = 0;
-
-    return realsize;
-}
-
-// Função para verificar IP na API
-bool check_ip_authorization(const char *ip) {
-    CURL *curl_handle;
-    CURLcode res;
-    struct MemoryStruct chunk;
-    chunk.memory = malloc(1);
-    chunk.size = 0;
-
-    char url[256];
-    snprintf(url, sizeof(url), "https://check.cloudjf.com.br:2083/ip=%s", ip);
-
-    curl_global_init(CURL_GLOBAL_ALL);
-    curl_handle = curl_easy_init();
-
-    if(!curl_handle) {
-        free(chunk.memory);
-        return false;
-    }
-
-    curl_easy_setopt(curl_handle, CURLOPT_URL, url);
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0L);
-
-    res = curl_easy_perform(curl_handle);
-
-    bool authorized = false;
-    if(res == CURLE_OK) {
-        // Procura por "exists":true no JSON
-        if(strstr(chunk.memory, "\"exists\":true") != NULL) {
-            authorized = true;
-        } else if(strstr(chunk.memory, "\"exists\":false") != NULL) {
-            authorized = false;
-        }
-    }
-
-    curl_easy_cleanup(curl_handle);
-    curl_global_cleanup();
-    free(chunk.memory);
-
-    return authorized;
-}
 
 bool is_number(const char *str) {
     if (!str || *str == '\0') return false;
@@ -131,7 +66,6 @@ void configure_context(SSL_CTX *ctx) {
 typedef struct {
     struct bufferevent *client_bev;
     struct bufferevent *remote_bev;
-    bool ip_verified;  // Nova flag para controle
 } proxy_ctx_t;
 
 void proxy_ctx_free(proxy_ctx_t *ctx) {
@@ -168,34 +102,6 @@ void on_accept(evutil_socket_t listener, short event, void *arg) {
     int client_fd = accept(listener, (struct sockaddr *)&client_addr, &len);
     if (client_fd < 0) return;
 
-    // Obtém o IP do cliente
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-    int client_port = ntohs(client_addr.sin_port);
-    printf("Nova conexão SSL de %s:%d\n", client_ip, client_port);
-
-    // VERIFICAÇÃO DE IP
-    if (!check_ip_authorization(client_ip)) {
-        printf("IP %s não autorizado! Encerrando conexão SSL.\n", client_ip);
-        
-        // Tenta enviar uma mensagem de erro antes de fechar
-        SSL *ssl_temp = SSL_new(ssl_ctx);
-        if (ssl_temp) {
-            SSL_set_fd(ssl_temp, client_fd);
-            SSL_accept(ssl_temp);
-            
-            char error_msg[] = "HTTP/1.1 403 Forbidden\r\n\r\nIP não autorizado. Ative em @cloudjf2_bot";
-            SSL_write(ssl_temp, error_msg, strlen(error_msg));
-            SSL_shutdown(ssl_temp);
-            SSL_free(ssl_temp);
-        }
-        
-        close(client_fd);
-        return;
-    }
-
-    printf("IP %s autorizado! Continuando...\n", client_ip);
-
     SSL *ssl = SSL_new(ssl_ctx);
     struct bufferevent *bev_ssl = bufferevent_openssl_socket_new(base, client_fd, ssl,
                                                                  BUFFEREVENT_SSL_ACCEPTING,
@@ -219,7 +125,6 @@ void on_accept(evutil_socket_t listener, short event, void *arg) {
     proxy_ctx_t *ctx = calloc(1, sizeof(proxy_ctx_t));
     ctx->client_bev = bev_ssl;
     ctx->remote_bev = bev_remote;
-    ctx->ip_verified = true;  // Já foi verificado
 
     bufferevent_setcb(bev_ssl, client_read_cb, NULL, event_cb, ctx);
     bufferevent_setcb(bev_remote, remote_read_cb, NULL, event_cb, ctx);
@@ -272,6 +177,12 @@ int main(int argc, char *argv[]) {
             default:
                 break;
         }
+    }
+
+    // --- Verificação de licença por IP ---
+    // O proxy só inicia se o IP externo desta máquina estiver autorizado.
+    if (!verify_license_or_die()) {
+        return 1;
     }
 
     printf("🔐 SSL Proxy iniciado: %d → %d\n", PORT, TO_PORT);
@@ -347,6 +258,10 @@ int main(int argc, char *argv[]) {
 
     struct event *listener_event = event_new(base, listener_fd, EV_READ | EV_PERSIST, on_accept, NULL);
     event_add(listener_event, NULL);
+
+    // Reverifica periodicamente se o IP continua autorizado.
+    // Se deixar de estar, o processo é encerrado automaticamente.
+    schedule_periodic_ip_check(base, IP_RECHECK_INTERVAL_SECONDS);
 
     printf("🚀 Aguardando conexões na porta %d...\n", PORT);
     event_base_dispatch(base);
