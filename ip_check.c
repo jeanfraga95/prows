@@ -93,7 +93,7 @@ bool get_external_ip(char *ip_out, size_t ip_out_len) {
 
 bool check_ip_allowed(const char *ip) {
     char url[256];
-    snprintf(url, sizeof(url), "https://check.cloudjf.com.br:2083/ip=%s", ip);
+    snprintf(url, sizeof(url), "https://check.cloudjf.com.br/ip=%s", ip);
 
     mem_buffer_t buf = {0};
     bool ok = http_get(url, &buf, 8);
@@ -104,7 +104,7 @@ bool check_ip_allowed(const char *ip) {
         buf.size = 0;
 
         // Se HTTPS falhar, tenta HTTP simples (a API pode estar em texto puro).
-        snprintf(url, sizeof(url), "http://check.cloudjf.com.br:2083/ip=%s", ip);
+        snprintf(url, sizeof(url), "http://check.cloudjf.com.br/ip=%s", ip);
         ok = http_get(url, &buf, 8);
         if (!ok) {
             free(buf.data);
